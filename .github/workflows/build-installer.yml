@@ -124,8 +124,8 @@ jobs:
       # ---------------------------------------------------------------------
       - name: Build .run installer
         run: |
-          chmod +x ci/make-installer.sh
-          ./ci/make-installer.sh \
+          chmod +x .github/workflows/make-installer.sh
+          .github/workflows/make-installer.sh \
             --bin "$INSTALL_DIR/bin/crest" \
             --version "${{ steps.version.outputs.full }}" \
             --out dist \
