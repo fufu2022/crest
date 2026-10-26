@@ -1,0 +1,202 @@
+name: Build Linux x86_64 installer
+
+# Builds a statically linked CREST binary and wraps it into a self-extracting
+# installer: crest-<version>-<sha>-x86_64-linux.run
+#
+# Runs on every push. The installer shows up under
+#   Actions -> this run -> Artifacts
+#
+# Typical build time: ~4-6 min on a 4-core runner.
+
+on:
+  push:
+  workflow_dispatch: {}        # also allow "Run workflow" from the Actions tab
+
+# Cancel superseded builds on the same ref (saves runner minutes)
+concurrency:
+  group: crest-installer-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  BUILD_DIR: _build
+  INSTALL_DIR: _dist
+
+jobs:
+  installer:
+    name: static build + .run installer
+    runs-on: ubuntu-latest          # use ubuntu-22.04 if you want an older toolchain
+    timeout-minutes: 60
+
+    steps:
+      # ---------------------------------------------------------------------
+      # Source (submodules are REQUIRED: tblite, gfn0, gfnff, pvol, lwoniom, ...)
+      # ---------------------------------------------------------------------
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0            # so `git describe` can see tags
+
+      - name: Determine version
+        id: version
+        run: |
+          set -euo pipefail
+          # project version as declared in CMakeLists.txt (e.g. 3.0.2)
+          base=$(sed -n 's/^[[:space:]]*VERSION[[:space:]]\{1,\}\([0-9][0-9.]*\).*/\1/p' \
+                 CMakeLists.txt | head -n 1)
+          base=${base:-0.0.0}
+          sha=$(git rev-parse --short HEAD)
+          echo "base=${base}"      >> "$GITHUB_OUTPUT"
+          echo "full=${base}-${sha}" >> "$GITHUB_OUTPUT"
+
+      # ---------------------------------------------------------------------
+      # Toolchain
+      # ---------------------------------------------------------------------
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gfortran build-essential cmake ninja-build \
+            libopenblas-dev pkg-config xz-utils
+
+      - name: Show toolchain
+        run: |
+          gfortran --version | head -n 1
+          cmake --version | head -n 1
+          ninja --version
+          dpkg -s libopenblas-dev | grep -E '^(Package|Version)'
+
+      # ---------------------------------------------------------------------
+      # Configure + build (STATICBUILD=ON -> fully static binary, no deps)
+      # ---------------------------------------------------------------------
+      - name: Configure
+        run: >
+          cmake -B "$BUILD_DIR" -G Ninja
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DCMAKE_INSTALL_PREFIX="$PWD/$INSTALL_DIR"
+          -DCMAKE_INSTALL_LIBDIR=lib
+          -DWITH_TESTS=OFF
+          -DSTATICBUILD=ON
+
+      - name: Build
+        run: ninja -C "$BUILD_DIR"
+
+      - name: Install
+        run: ninja -C "$BUILD_DIR" install
+
+      # ---------------------------------------------------------------------
+      # Verify the artifact before shipping it
+      # ---------------------------------------------------------------------
+      - name: Verify binary is static
+        run: |
+          set -euo pipefail
+          bin="$PWD/$INSTALL_DIR/bin/crest"
+          file "$bin" > /tmp/file.txt
+          cat /tmp/file.txt
+          # `file` must report "statically linked" (no interpreter, no NEEDED entries)
+          grep -q 'statically linked' /tmp/file.txt || {
+            echo "ERROR: binary is not statically linked -- it would depend on the"
+            echo "       runner's glibc / libgfortran / OpenBLAS versions."
+            ldd "$bin" || true
+            exit 1
+          }
+          echo "OK: statically linked"
+          "$bin" --version
+
+      - name: Smoke test (GFN-FF conformer search)
+        run: |
+          set -euo pipefail
+          bin="$PWD/$INSTALL_DIR/bin/crest"
+          tmp=$(mktemp -d)
+          cp examples/expl-0/struc.xyz "$tmp/"
+          cd "$tmp"
+          OMP_NUM_THREADS=2 timeout 900 "$bin" struc.xyz --gff --noreopt > crest.log 2>&1 || {
+            echo "smoke test failed"; tail -n 50 crest.log; exit 1; }
+          grep -q "CREST terminated normally" crest.log
+          grep -E "number of unique conformers" crest.log
+          echo "OK: smoke test passed"
+
+      # ---------------------------------------------------------------------
+      # Build the self-extracting installer
+      # ---------------------------------------------------------------------
+      - name: Build .run installer
+        run: |
+          chmod +x ci/make-installer.sh
+          ./ci/make-installer.sh \
+            --bin "$INSTALL_DIR/bin/crest" \
+            --version "${{ steps.version.outputs.full }}" \
+            --out dist \
+            --strip
+
+      - name: Test the installer (installs into a temp prefix)
+        run: |
+          set -euo pipefail
+          run=$(ls dist/crest-*-x86_64-linux.run)
+          prefix=$(mktemp -d)
+          sh "$run" -y --prefix="$prefix"
+          "$prefix/bin/crest" --version
+          sh "$run" --uninstall --prefix="$prefix"
+          test ! -e "$prefix/bin/crest"
+          echo "OK: installer install/uninstall works"
+
+      - name: Write build info
+        run: |
+          {
+            echo "CREST version: ${{ steps.version.outputs.full }}"
+            echo "commit:        ${{ github.sha }}"
+            echo "built on:      $(date -u '+%Y-%m-%d %H:%M UTC') by GitHub Actions run ${{ github.run_id }}"
+            echo "runner:        ${{ runner.os }} / $(uname -m)"
+            echo "compiler:      $(gfortran --version | head -n 1)"
+            echo "link mode:     fully static (STATICBUILD=ON, OpenBLAS + libgfortran + libgomp)"
+            echo ""
+            echo "Install:  sh $(basename "$(ls dist/crest-*.run)" | head -n1)"
+            echo "        or: sh <file>.run --prefix=\$HOME/.local"
+          } > dist/BUILD-INFO.txt
+          cat dist/BUILD-INFO.txt
+
+      # ---------------------------------------------------------------------
+      # Publish
+      # ---------------------------------------------------------------------
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: crest-x86_64-linux-${{ steps.version.outputs.full }}
+          path: |
+            dist/crest-*.run
+            dist/crest-*.run.sha256
+            dist/BUILD-INFO.txt
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Summary
+        run: |
+          {
+            echo "### CREST x86_64 Linux installer"
+            echo ""
+            echo "| item | value |"
+            echo "| --- | --- |"
+            echo "| version | \`${{ steps.version.outputs.full }}\` |"
+            echo "| commit | \`${{ github.sha }}\` |"
+            echo "| file | \`$(basename "$(ls dist/crest-*.run)")\` |"
+            echo "| size | $(du -h "$(ls dist/crest-*.run)" | cut -f1) |"
+            echo ""
+            echo "Download it from the **Artifacts** section of this run, then:"
+            echo '```sh'
+            echo "chmod +x crest-*.run && ./crest-*.run -y"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ---------------------------------------------------------------------
+      # OPTIONAL: attach the installer to a GitHub Release on tags
+      # Remove the leading '#' if you want releases as well.
+      # ---------------------------------------------------------------------
+      # - name: Upload to release
+      #   if: startsWith(github.ref, 'refs/tags/')
+      #   uses: softprops/action-gh-release@v2
+      #   with:
+      #     files: |
+      #       dist/crest-*.run
+      #       dist/crest-*.run.sha256
